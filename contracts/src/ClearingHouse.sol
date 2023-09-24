@@ -14,6 +14,8 @@ contract ClearingHouse {
     IERC20 public indexToken;
 
     uint256 public constant BASIS_POINTS_DIVISOR = 10000;
+    uint256 public constant MAX_LEVERAGE = 100 * 10000; // 100x
+    uint256 public constant MIN_MARGIN = 5 * 1000; // 0.5%
 
     uint256 public fundingInterval = 1 minutes;
     // lastFundingTime tracks the last time funding rate is updated
@@ -22,23 +24,27 @@ contract ClearingHouse {
     uint256 public cumulativeFundingRate;
     uint256 public reservedAmounts;
 
-    uint256 public globalShortSizes;
-    uint256 public globalShortAveragePrices;
+    uint256 public totalShortAmount;
+    uint256 public shortAveragePrice;
 
-    uint256 public poolAmounts;
+    uint256 public poolAmount;
 
     mapping(bytes32 => Position.Info) public positions;
 
     event UpdateFundingRate(uint256 indexed time, uint256 indexed fundingRate);
 
+    event LiquidatedPosition(
+        address indexed account, bool indexed isLong, uint256 size, uint256 collateral, uint256 delta
+    );
+
     constructor(address _gasOracle) {
         gasOracle = GasOracle(_gasOracle);
     }
 
-    function increasePosition(address _account, uint256 _amount, bool _isLong) external payable {
-        require(msg.value >= _amount, "ClearingHouse: insufficient collateral");
+    function increasePosition(address _account, uint256 _amount, uint256 _leverage, bool _isLong) external payable {
+        require(msg.value >= _amount * _leverage / BASIS_POINTS_DIVISOR, "ClearingHouse: insufficient collateral");
 
-        updateCummlativeFundingRate();
+        updateFunding();
 
         bytes32 key = getPositionKey(_account, _isLong);
         Position.Info storage position = positions[key];
@@ -54,7 +60,7 @@ contract ClearingHouse {
 
         position.collateral = position.collateral + _amount;
         position.entryFundingRate = cumulativeFundingRate;
-        position.size = position.size + _amount;
+        position.size = position.size + _amount * _leverage / BASIS_POINTS_DIVISOR;
         position.lastIncreasedTime = block.timestamp;
 
         require(position.size >= position.collateral, "ClearingHouse: position size < collateral");
@@ -66,25 +72,46 @@ contract ClearingHouse {
         _depositToReserve(_amount);
 
         if (_isLong) {
-            poolAmounts += _amount;
+            poolAmount += _amount;
         } else {
-            if (globalShortSizes == 0) {
-                globalShortAveragePrices = price;
+            if (totalShortAmount == 0) {
+                shortAveragePrice = price;
             } else {
-                globalShortAveragePrices = getNextGlobalShortAveragePrice(price, _amount);
+                shortAveragePrice = getNextShortAveragePrice(price, _amount);
             }
 
-            globalShortSizes += _amount;
+            totalShortAmount += _amount;
         }
     }
 
-    function updateMargin() external payable {}
-
     function settlePosition() external {}
 
-    function liquidatePosition() external {}
+    function liquidatePosition(address _account, bool _isLong) external {
+        updateFunding();
 
-    function updateCummlativeFundingRate() public {
+        Position.Info memory position = positions[getPositionKey(_account, _isLong)];
+        uint256 currentPrice = gasOracle.getLatestGasPrice();
+
+        // start with 10 and 500, price - 50
+        // price drops to 49, delta = 10 - (50 - 49.4) * 10 = 4
+
+        uint256 delta = position.collateral * (position.averagePrice - currentPrice) / BASIS_POINTS_DIVISOR;
+        if (_isLong) {
+            if (
+                position.collateral < delta
+                    || position.collateral - delta < (MIN_MARGIN * position.size) / BASIS_POINTS_DIVISOR
+            ) {
+                // transfer to the pool
+                poolAmount += position.collateral;
+            } else {
+                revert("ClearingHouse: insufficient collateral");
+            }
+        }
+
+        emit LiquidatedPosition(_account, _isLong, position.size, position.collateral, delta);
+    }
+
+    function updateFunding() public {
         if (lastFundingTime == 0) {
             // floor by fundingInterval
             lastFundingTime = (block.timestamp / fundingInterval) * fundingInterval;
@@ -112,7 +139,7 @@ contract ClearingHouse {
 
     function _depositToReserve(uint256 _amount) internal {
         reservedAmounts += _amount;
-        require(reservedAmounts <= poolAmounts, "ClearingHouse: insufficient pool balance");
+        require(reservedAmounts <= poolAmount, "ClearingHouse: insufficient pool balance");
     }
 
     function getPositionKey(address _account, bool _isLong) public pure returns (bytes32) {
@@ -142,9 +169,9 @@ contract ClearingHouse {
 
     // for longs: nextAveragePrice = (nextPrice * nextSize)/ (nextSize + delta)
     // for shorts: nextAveragePrice = (nextPrice * nextSize) / (nextSize - delta)
-    function getNextGlobalShortAveragePrice(uint256 _nextPrice, uint256 _sizeDelta) public view returns (uint256) {
-        uint256 size = globalShortSizes;
-        uint256 averagePrice = globalShortAveragePrices;
+    function getNextShortAveragePrice(uint256 _nextPrice, uint256 _sizeDelta) public view returns (uint256) {
+        uint256 size = totalShortAmount;
+        uint256 averagePrice = shortAveragePrice;
         uint256 priceDelta = averagePrice > _nextPrice ? averagePrice - _nextPrice : _nextPrice - averagePrice;
         uint256 delta = (size * priceDelta) / averagePrice;
         bool hasProfit = averagePrice > _nextPrice;
