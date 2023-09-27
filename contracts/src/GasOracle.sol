@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.19;
 
-import {IAxiomV2Client} from "./IAxiomV2Client.sol";
+import {IAxiomV2Client} from "./interfaces/IAxiomV2Client.sol";
 
 contract GasOracle is IAxiomV2Client {
     event GasPriceUpdated(uint256 indexed blockNumber, uint256 indexed gasPrice);

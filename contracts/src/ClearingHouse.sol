@@ -3,7 +3,7 @@ pragma solidity ^0.8.13;
 
 import {GasOracle} from "./GasOracle.sol";
 
-import {Position} from "./Position.sol";
+import {Position} from "./libraries/Position.sol";
 
 import {IERC20} from "./interfaces/IERC20.sol";
 
